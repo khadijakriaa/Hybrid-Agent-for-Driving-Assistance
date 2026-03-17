@@ -61,7 +61,7 @@ class ReactiveLayer:
 
         alert = None
 
-        # Check each danger type in priority order
+        # PRIORITÉ 1: Collision imminente (le plus dangereux)
         if self._check_emergency_brake(vehicle_state):
             ttc = self._calculate_ttc(vehicle_state)
             alert = CriticalAlert(
@@ -69,10 +69,16 @@ class ReactiveLayer:
                 severity="emergency",
                 message="EMERGENCY: Collision imminent! Brake hard now!",
                 timestamp=time.time(),
-                reaction_time_ms=0.0,  # will be set later
+                reaction_time_ms=0.0,
                 parameters={"ttc": ttc, "required_deceleration": self._calculate_required_decel(vehicle_state)}
             )
 
+        # PRIORITÉ 2: Zone dangereuse (basée sur les indicateurs du dataset)
+        elif self._check_danger_zone(vehicle_state):
+            alert = self._create_danger_zone_alert(vehicle_state)
+            print(f"🔴 DANGER ZONE DETECTED!")  # Pour déboguer
+
+        # PRIORITÉ 3: Vitesse critique
         elif self._check_critical_speed(vehicle_state):
             alert = CriticalAlert(
                 type="critical_speed",
@@ -84,6 +90,17 @@ class ReactiveLayer:
                             "speed_limit": vehicle_state.get('speed_limit', 90)}
             )
 
+        # PRIORITÉ 4: Freinage soudain du véhicule devant
+        elif self._check_sudden_obstacle(vehicle_state):
+            alert = CriticalAlert(
+                type="sudden_obstacle",
+                severity="critical",
+                message="CRITICAL: Sudden obstacle detected! Take evasive action!",
+                timestamp=time.time(),
+                reaction_time_ms=0.0
+            )
+
+        # PRIORITÉ 5: Distance de sécurité insuffisante
         elif self._check_unsafe_following(vehicle_state):
             distance = vehicle_state.get('leading_vehicle', {}).get('distance', 0)
             alert = CriticalAlert(
@@ -96,21 +113,11 @@ class ReactiveLayer:
                             "min_safe_distance": self._calculate_safe_distance(vehicle_state)}
             )
 
-        elif self._check_sudden_obstacle(vehicle_state):
-            alert = CriticalAlert(
-                type="sudden_obstacle",
-                severity="critical",
-                message="CRITICAL: Sudden obstacle detected! Take evasive action!",
-                timestamp=time.time(),
-                reaction_time_ms=0.0
-            )
-
-        # Calculate reaction time
+        # Calcul du temps de réaction
         if alert:
-            reaction_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
+            reaction_time = (time.perf_counter() - start_time) * 1000
             alert.reaction_time_ms = reaction_time
 
-            # Update performance stats
             self.alert_history.append(alert)
             self.performance_stats["alerts_generated"] += 1
             self.performance_stats["avg_response_time"] = (
@@ -120,12 +127,79 @@ class ReactiveLayer:
                 self.performance_stats["max_response_time"], reaction_time
             )
 
-            # Log if response is too slow
-            if reaction_time > self.config.MAX_REACTIVE_TIME_MS:
-                print(
-                    f"⚠️  Warning: Reactive response took {reaction_time:.1f}ms (> {self.config.MAX_REACTIVE_TIME_MS}ms)")
-
         return alert
+    # ===== NOUVELLES FONCTIONS POUR ZONE DANGEREUSE =====
+
+    def _check_danger_zone(self, state: Dict) -> bool:
+        """
+        Vérifie si le véhicule se trouve dans une zone dangereuse
+        """
+        # Indicateurs directs de danger
+        hard_brake = state.get('hard_brake', 0)
+        leader_stopped = state.get('leader_stopped', 0)
+        danger_accel = state.get('danger_accel_toward_leader', 0)
+        no_reaction = state.get('no_reaction_to_stopped_leader', 0)
+
+        direct_danger = [
+            hard_brake == 1,
+            leader_stopped == 1,
+            danger_accel == 1,
+            no_reaction == 1
+        ]
+
+        # Si un indicateur direct est présent, c'est une zone dangereuse
+        if any(direct_danger):
+            if hard_brake == 1:
+                print(f"⚠️ Danger zone: hard_brake detected")
+            return True
+
+        # Indicateurs indirects
+        ttc = state.get('TTC', float('inf'))
+        leader_gap = state.get('LeaderGap', float('inf'))
+
+        if ttc < 5.0 and ttc > 2.0:
+            print(f"⚠️ Danger zone: TTC={ttc:.2f}s")
+            return True
+
+        if leader_gap != float('inf'):
+            safe_distance = self._calculate_safe_distance(state)
+            if leader_gap < safe_distance * 0.7:
+                print(f"⚠️ Danger zone: gap={leader_gap:.1f}m < safe_dist*0.7")
+                return True
+
+        return False
+    def _create_danger_zone_alert(self, state: Dict) -> CriticalAlert:
+        """Crée une alerte pour zone dangereuse"""
+        # Identifier la raison du danger
+        reasons = []
+
+        if state.get('hard_brake', 0) == 1:
+            reasons.append("freinage d'urgence détecté")
+        if state.get('leader_stopped', 0) == 1:
+            reasons.append("véhicule arrêté devant")
+        if state.get('danger_accel_toward_leader', 0) == 1:
+            reasons.append("approche dangereuse")
+        if state.get('TTC', float('inf')) < 5.0:
+            reasons.append(f"TTC dangereux: {state.get('TTC', 0):.1f}s")
+
+        reason_text = ", ".join(reasons) if reasons else "conditions dangereuses"
+
+        return CriticalAlert(
+            type="danger_zone",
+            severity="critical",
+            message=f"⚠️ ZONE DANGEREUSE: {reason_text}",
+            timestamp=time.time(),
+            reaction_time_ms=0.0,
+            parameters={
+                "ttc": state.get('TTC', None),
+                "speed": state.get('speed', 0),
+                "hard_brake": state.get('hard_brake', 0),
+                "leader_stopped": state.get('leader_stopped', 0),
+                "danger_accel": state.get('danger_accel_toward_leader', 0)
+            }
+        )
+
+    # ===== FONCTIONS EXISTANTES =====
 
     def _check_emergency_brake(self, state: Dict) -> bool:
         """Check if emergency braking is required (TTC < threshold)"""
@@ -133,35 +207,33 @@ class ReactiveLayer:
         if ttc is None or ttc > self.config.CRITICAL_TTC:
             return False
 
-        # Check if deceleration required is beyond vehicle capability
         required_decel = self._calculate_required_decel(state)
-        return required_decel > VEHICLE_CONFIG.MAX_DECELERATION * 0.8  # Use 80% of max
+        return required_decel > VEHICLE_CONFIG.MAX_DECELERATION * 0.8
 
     def _check_critical_speed(self, state: Dict) -> bool:
         """Check if speed is critically high"""
         current_speed = state.get('speed', 0)
         speed_limit = state.get('speed_limit', 90)
 
-        # Critical if exceeding speed limit by >20% or absolute threshold
         return (current_speed > self.config.CRITICAL_SPEED or
-                current_speed > speed_limit * 1.2)
+                current_speed > speed_limit * 1.1)
 
     def _check_unsafe_following(self, state: Dict) -> bool:
-        """Check if following distance is unsafe"""
         if 'leading_vehicle' not in state or not state['leading_vehicle']:
             return False
 
         distance = state['leading_vehicle'].get('distance', float('inf'))
-        safe_distance = self._calculate_safe_distance(state)
+        if distance == float('inf'):
+            return False
 
-        return distance < safe_distance * 0.5  # Less than 50% of safe distance
+        safe_distance = self._calculate_safe_distance(state)
+        return distance < safe_distance * 0.5
 
     def _check_sudden_obstacle(self, state: Dict) -> bool:
         """Check for sudden obstacles (rapid deceleration ahead)"""
         if 'leading_vehicle' not in state:
             return False
 
-        # Check if leading vehicle is decelerating rapidly
         lead_accel = state['leading_vehicle'].get('acceleration', 0)
         return lead_accel < -self.config.EMERGENCY_DECEL_THRESHOLD
 
@@ -173,13 +245,13 @@ class ReactiveLayer:
             return None
 
         distance = state['leading_vehicle']['distance']
-        ego_speed = state.get('speed', 0) / 3.6  # Convert to m/s
+        ego_speed = state.get('speed', 0) / 3.6
         lead_speed = state['leading_vehicle'].get('speed', 0) / 3.6
 
         relative_speed = ego_speed - lead_speed
 
         if relative_speed <= 0:
-            return float('inf')  # No collision course
+            return float('inf')
 
         return distance / relative_speed
 
@@ -189,16 +261,13 @@ class ReactiveLayer:
         if ttc is None or ttc == float('inf'):
             return 0.0
 
-        ego_speed = state.get('speed', 0) / 3.6  # m/s
-        required_decel = ego_speed / ttc if ttc > 0 else float('inf')
-
-        return required_decel
+        ego_speed = state.get('speed', 0) / 3.6
+        return ego_speed / ttc if ttc > 0 else float('inf')
 
     def _calculate_safe_distance(self, state: Dict) -> float:
         """Calculate safe following distance based on speed"""
         speed_mps = state.get('speed', 0) / 3.6
 
-        # 2-second rule plus vehicle length
         return max(
             self.config.MIN_SAFE_DISTANCE,
             speed_mps * 2 + VEHICLE_CONFIG.VEHICLE_LENGTH
@@ -211,7 +280,7 @@ class ReactiveLayer:
             "meets_sla": self.performance_stats.get("max_response_time", 0) < self.config.MAX_REACTIVE_TIME_MS,
             "alert_types": {
                 alert.type: len([a for a in self.alert_history if a.type == alert.type])
-                for alert in self.alert_history[:10]  # Recent alerts only
+                for alert in self.alert_history[:10]
             }
         }
 
@@ -236,10 +305,10 @@ def test_reactive_layer():
     # Test 1: Emergency brake scenario
     print("\nTest 1: Emergency Brake")
     test_state = {
-        "speed": 80,  # 80 km/h
+        "speed": 80,
         "leading_vehicle": {
-            "distance": 10,  # 10 meters
-            "speed": 0,  # stopped vehicle
+            "distance": 10,
+            "speed": 0,
             "acceleration": 0
         }
     }
@@ -252,22 +321,20 @@ def test_reactive_layer():
     else:
         print("❌ No alert (should have detected emergency)")
 
-    # Test 2: Normal driving
-    print("\nTest 2: Normal Driving")
+    # Test 2: Danger zone with hard brake
+    print("\nTest 2: Danger Zone (hard brake)")
     test_state = {
-        "speed": 70,
-        "leading_vehicle": {
-            "distance": 50,
-            "speed": 68,
-            "acceleration": 0
-        }
+        "speed": 60,
+        "hard_brake": 1,
+        "TTC": 3.5,
+        "LeaderGap": 15
     }
 
     alert = reactive.check_immediate_danger(test_state)
-    if alert:
-        print(f"❌ Unexpected alert: {alert.type}")
+    if alert and alert.type == "danger_zone":
+        print(f"✅ Danger zone detected: {alert.message}")
     else:
-        print("✅ Correctly no alert")
+        print("❌ Failed to detect danger zone")
 
     # Test 3: Critical speed
     print("\nTest 3: Critical Speed")
@@ -293,5 +360,4 @@ def test_reactive_layer():
 
 
 if __name__ == "__main__":
-    # Run tests if this file is executed directly
     test_reactive_layer()
