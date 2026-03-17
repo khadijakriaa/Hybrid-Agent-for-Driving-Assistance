@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any, Tuple
 import numpy as np
 
 from config.settings import AGENT_CONFIG, VEHICLE_CONFIG, AgentConfig
+from core.agent.scenario_model_registry import ScenarioModelRegistry
 
 
 @dataclass
@@ -43,75 +44,230 @@ class ReactiveLayer:
     def __init__(self, config: AgentConfig = None):
         self.config = config or AGENT_CONFIG
         self.alert_history = []
+        self.model_registry = ScenarioModelRegistry()
+        self.loaded_scenario_models = self.model_registry.load_available_models()
         self.performance_stats = {
             "total_checks": 0,
             "alerts_generated": 0,
             "avg_response_time": 0.0,
             "max_response_time": 0.0
         }
-        print("✅ Reactive Layer initialized")
+        if self.loaded_scenario_models:
+            print(f"✅ Reactive Layer initialized (models: {', '.join(self.loaded_scenario_models)})")
+        else:
+            print("✅ Reactive Layer initialized (no saved scenario models found yet)")
+
+    # ===== RULE-BASED SCENARIO DETECTION =====
+
+    def _detect_scenario(self, vehicle_state: Dict) -> Optional[str]:
+        """
+        Detect which scenario (intersection, overtaking, danger_zone) using rules.
+        Priority: intersection > overtaking > danger_zone (based on feature indicators)
+        
+        Returns: "danger_zone", "overtaking", "intersection", or None
+        """
+        # Priority 1: Check for intersection (angle, lane undefined, traffic signals)
+        if self._is_intersection_scenario(vehicle_state):
+            return "intersection"
+        
+        # Priority 2: Check for overtaking (lane change, speed differential, safe distance)
+        if self._is_overtaking_scenario(vehicle_state):
+            return "overtaking"
+        
+        # Priority 3: Check for danger_zone (hard brake, low TTC, leader stopped)
+        if self._is_danger_zone_scenario(vehicle_state):
+            return "danger_zone"
+        
+        # Fallback: Return most probable scenario if none detected clearly
+        return self._fallback_scenario_detection(vehicle_state)
+
+    def _is_danger_zone_scenario(self, state: Dict) -> bool:
+        """
+        Detect danger_zone using rules (explicit emergency indicators):
+        - Hard brake flag
+        - Leader stopped flag
+        - Danger acceleration toward leader
+        - No reaction to stopped leader
+        Only return True if explicit danger flags are set
+        """
+        # Hard brake detected
+        if state.get('hard_brake', 0) == 1:
+            return True
+        
+        # Leader stopped
+        if state.get('leader_stopped', 0) == 1:
+            return True
+        
+        # Danger acceleration toward leader
+        if state.get('danger_accel_toward_leader', 0) == 1:
+            return True
+        
+        # No reaction to stopped leader
+        if state.get('no_reaction_to_stopped_leader', 0) == 1:
+            return True
+        
+        return False
+
+    def _is_overtaking_scenario(self, state: Dict) -> bool:
+        """
+        Detect overtaking using rules:
+        - Lane change indicators
+        - SafeDistance flags/metrics
+        - Positive speed differential (ego faster than leader)
+        - Lateral position changes
+        - Lane opposite direction indicators
+        """
+        # Lane change in progress
+        if state.get('lane_change_in_progress', 0) == 1:
+            return True
+        
+        # Lane change maneuver
+        if state.get('LaneChange', 0) == 1:
+            return True
+        
+        # Lane opposite (attempting to change to opposite lane)
+        if state.get('lane_opposite_change', 0) == 1:
+            return True
+        
+        # Safe distance metric (indicates overtaking assessment)
+        safe_distance = state.get('SafeDistance', None)
+        if isinstance(safe_distance, (int, float)) and safe_distance >= 0:
+            # Safe distance exists -> being evaluated for overtaking
+            leader_gap = state.get('LeaderGap', float('inf'))
+            if isinstance(leader_gap, (int, float)) and leader_gap > safe_distance:
+                # Gap > safe distance -> could be overtaking
+                ego_speed = state.get('speed', 0)
+                leader_speed = state.get('LeaderSpeed', 0)
+                if ego_speed > leader_speed + 5:  # Going faster than leader
+                    return True
+        
+        # Speed differential (ego faster than leader by significant margin)
+        ego_speed = state.get('speed', 0)
+        leader_speed = state.get('LeaderSpeed', state.get('speed', 0))
+        if ego_speed - leader_speed > 10:  # At least 10 km/h faster
+            # Also check if gap is increasing (safe overtaking) or exists (preparing to overtake)
+            leader_gap = state.get('LeaderGap', float('inf'))
+            if isinstance(leader_gap, (int, float)) and leader_gap > 5:
+                return True
+        
+        # Relative position changing (lateral position change)
+        if state.get('relative_x_position', None) is not None:
+            lateral_change = abs(state.get('relative_x_position', 0))
+            if lateral_change > 1.5:  # Significant lateral movement
+                return True
+        
+        return False
+
+    def _is_intersection_scenario(self, state: Dict) -> bool:
+        """
+        Detect intersection using rules:
+        - Intersection flag
+        - Lane not well-defined or multiple lanes
+        - Traffic light/signal presence
+        - Angle changes
+        - Other vehicles at different angles
+        """
+        # Direct intersection flag
+        if state.get('Intersection', 0) == 1:
+            return True
+        
+        if state.get('intersection', 0) == 1:
+            return True
+        
+        # Lane undefined or problematic
+        lane = state.get('Lane', None)
+        if lane is None or lane == -1 or (isinstance(lane, (int, float)) and lane == 0):
+            # Undefined lane often indicates intersection area
+            return True
+        
+        # Traffic signal/light presence
+        if state.get('traffic_signal', 0) == 1:
+            return True
+        
+        if state.get('traffic_light', 0) == 1:
+            return True
+        
+        # Angle change (heading change)
+        if state.get('Angle', None) is not None:
+            angle = state.get('Angle', 0)
+            if isinstance(angle, (int, float)) and angle != 0:
+                return True
+        
+        # Multiple vehicles in different directions
+        if state.get('num_vehicles_nearby', 0) > 2:
+            return True
+        
+        # No leading vehicle but other vehicles present (intersection scenario)
+        leader_gap = state.get('LeaderGap', float('inf'))
+        num_vehicles = state.get('num_vehicles_nearby', 0)
+        if (isinstance(leader_gap, (int, float)) and leader_gap == float('inf')) or leader_gap > 100:
+            if num_vehicles > 0:
+                return True
+        
+        return False
+
+    def _fallback_scenario_detection(self, state: Dict) -> Optional[str]:
+        """
+        Fallback scenario detection based on available features.
+        Used when no clear scenario is detected.
+        """
+        # High speed + no leader -> likely intersection
+        speed = state.get('speed', 0)
+        leader_gap = state.get('LeaderGap', float('inf'))
+        if speed > 40 and (isinstance(leader_gap, (int, float)) and leader_gap > 50):
+            return "intersection"
+        
+        # Has leader + moderate speed -> likely following/danger_zone
+        if isinstance(leader_gap, (int, float)) and leader_gap < 100:
+            if speed > 20:
+                ttc = state.get('TTC', float('inf'))
+                if isinstance(ttc, (int, float)) and ttc < 10:
+                    return "danger_zone"
+                else:
+                    return "overtaking"
+        
+        return None
 
     def check_immediate_danger(self, vehicle_state: Dict) -> Optional[CriticalAlert]:
         """
-        Check for immediate dangers (must complete in < 50ms)
-        Returns CriticalAlert if danger detected, None otherwise
+        Rule-based scenario detection + ML algorithm inference (must complete in < 50ms)
+        1. Detect scenario using rules (intersection, overtaking, danger_zone)
+        2. Call appropriate ML model for detected scenario
+        Returns CriticalAlert if danger detected, None otherwise.
         """
         start_time = time.perf_counter()
         self.performance_stats["total_checks"] += 1
 
         alert = None
 
-        # PRIORITÉ 1: Collision imminente (le plus dangereux)
-        if self._check_emergency_brake(vehicle_state):
-            ttc = self._calculate_ttc(vehicle_state)
-            alert = CriticalAlert(
-                type="emergency_brake",
-                severity="emergency",
-                message="EMERGENCY: Collision imminent! Brake hard now!",
-                timestamp=time.time(),
-                reaction_time_ms=0.0,
-                parameters={"ttc": ttc, "required_deceleration": self._calculate_required_decel(vehicle_state)}
-            )
+        # Step 1: Detect scenario using rules
+        detected_scenario = self._detect_scenario(vehicle_state)
+        
+        # Step 2: Call appropriate ML model if models are available
+        if self.loaded_scenario_models and detected_scenario and detected_scenario in self.loaded_scenario_models:
+            ml_result = self.evaluate_scenario_model(detected_scenario, vehicle_state)
+            if "error" not in ml_result:
+                risk = float(ml_result.get("risk_score", 0.0))
+                unsafe = bool(ml_result.get("is_unsafe", False))
 
-        # PRIORITÉ 2: Zone dangereuse (basée sur les indicateurs du dataset)
-        elif self._check_danger_zone(vehicle_state):
-            alert = self._create_danger_zone_alert(vehicle_state)
-            print(f"🔴 DANGER ZONE DETECTED!")  # Pour déboguer
+                if unsafe and risk >= 0.85:
+                    severity = "emergency"
+                elif unsafe and risk >= 0.70:
+                    severity = "critical"
+                elif risk >= 0.55:
+                    severity = "warning"
+                else:
+                    severity = None
 
-        # PRIORITÉ 3: Vitesse critique
-        elif self._check_critical_speed(vehicle_state):
-            alert = CriticalAlert(
-                type="critical_speed",
-                severity="critical",
-                message=f"CRITICAL: Speed {vehicle_state.get('speed', 0):.0f} km/h exceeds safety limit!",
-                timestamp=time.time(),
-                reaction_time_ms=0.0,
-                parameters={"current_speed": vehicle_state.get('speed', 0),
-                            "speed_limit": vehicle_state.get('speed_limit', 90)}
-            )
-
-        # PRIORITÉ 4: Freinage soudain du véhicule devant
-        elif self._check_sudden_obstacle(vehicle_state):
-            alert = CriticalAlert(
-                type="sudden_obstacle",
-                severity="critical",
-                message="CRITICAL: Sudden obstacle detected! Take evasive action!",
-                timestamp=time.time(),
-                reaction_time_ms=0.0
-            )
-
-        # PRIORITÉ 5: Distance de sécurité insuffisante
-        elif self._check_unsafe_following(vehicle_state):
-            distance = vehicle_state.get('leading_vehicle', {}).get('distance', 0)
-            alert = CriticalAlert(
-                type="unsafe_following",
-                severity="warning",
-                message=f"WARNING: Following too close! Distance: {distance:.1f}m",
-                timestamp=time.time(),
-                reaction_time_ms=0.0,
-                parameters={"following_distance": distance,
-                            "min_safe_distance": self._calculate_safe_distance(vehicle_state)}
-            )
+                if severity is not None:
+                    alert = CriticalAlert(
+                        type=f"{detected_scenario}_ml_risk",
+                        severity=severity,
+                        message=f"ML {severity.upper()}: {detected_scenario} risk score={risk:.2f}",
+                        timestamp=time.time(),
+                        reaction_time_ms=0.0,
+                        parameters=ml_result,
+                    )
 
         # Calcul du temps de réaction
         if alert:
@@ -128,6 +284,32 @@ class ReactiveLayer:
             )
 
         return alert
+
+    def evaluate_scenario_model(self, scenario: str, vehicle_state: Dict) -> Dict[str, Any]:
+        """Run saved model inference for a specific scenario.
+
+        Returns a dict with:
+        - prediction (0 unsafe, 1 safe)
+        - is_unsafe
+        - risk_score (probability of unsafe)
+        """
+        if not self.loaded_scenario_models:
+            return {"error": "no_models_loaded"}
+
+        if scenario not in self.loaded_scenario_models:
+            return {"error": f"model_not_loaded_for_{scenario}"}
+
+        try:
+            return self.model_registry.predict_risk(scenario, vehicle_state)
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def evaluate_all_scenarios(self, vehicle_state: Dict) -> Dict[str, Dict[str, Any]]:
+        """Run inference against all loaded scenario models."""
+        results: Dict[str, Dict[str, Any]] = {}
+        for scenario in self.loaded_scenario_models:
+            results[scenario] = self.evaluate_scenario_model(scenario, vehicle_state)
+        return results
     # ===== NOUVELLES FONCTIONS POUR ZONE DANGEREUSE =====
 
     def _check_danger_zone(self, state: Dict) -> bool:
