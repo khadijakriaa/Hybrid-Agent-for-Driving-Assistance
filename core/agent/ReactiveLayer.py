@@ -41,8 +41,10 @@ class ReactiveLayer:
     Implements reflex-like responses to immediate dangers.
     """
 
-    def __init__(self, config: AgentConfig = None):
+    def __init__(self, config: AgentConfig = None, confidence_threshold: float = 0.75):
+
         self.config = config or AGENT_CONFIG
+        self.confidence_threshold = confidence_threshold
         self.alert_history = []
         self.model_registry = ScenarioModelRegistry()
         self.loaded_scenario_models = self.model_registry.load_available_models()
@@ -54,6 +56,7 @@ class ReactiveLayer:
         }
         if self.loaded_scenario_models:
             print(f"✅ Reactive Layer initialized (models: {', '.join(self.loaded_scenario_models)})")
+            print(f"   Confidence threshold: {self.confidence_threshold:.0%}")
         else:
             print("✅ Reactive Layer initialized (no saved scenario models found yet)")
 
@@ -62,34 +65,41 @@ class ReactiveLayer:
     def _detect_scenario(self, vehicle_state: Dict) -> Optional[str]:
         """
         Detect which scenario (intersection, overtaking, danger_zone) using rules.
-        Priority: intersection > overtaking > danger_zone (based on feature indicators)
+        Priority: SAFETY FIRST - danger_zone > overtaking > intersection
         
         Returns: "danger_zone", "overtaking", "intersection", or None
         """
-        # Priority 1: Check for intersection (angle, lane undefined, traffic signals)
-        if self._is_intersection_scenario(vehicle_state):
-            return "intersection"
+        # Priority 1: Check for danger_zone (SAFETY CRITICAL - check first!)
+        # Hard brake, leader stopped, low TTC, close gap
+        if self._is_danger_zone_scenario(vehicle_state):
+            return "danger_zone"
         
-        # Priority 2: Check for overtaking (lane change, speed differential, safe distance)
+        # Priority 2: Check for overtaking (lane change, speed differential)
         if self._is_overtaking_scenario(vehicle_state):
             return "overtaking"
         
-        # Priority 3: Check for danger_zone (hard brake, low TTC, leader stopped)
-        if self._is_danger_zone_scenario(vehicle_state):
-            return "danger_zone"
+        # Priority 3: Check for intersection (traffic signal, angle changes)
+        if self._is_intersection_scenario(vehicle_state):
+            return "intersection"
         
         # Fallback: Return most probable scenario if none detected clearly
         return self._fallback_scenario_detection(vehicle_state)
 
     def _is_danger_zone_scenario(self, state: Dict) -> bool:
         """
-        Detect danger_zone using rules (explicit emergency indicators):
-        - Hard brake flag
-        - Leader stopped flag
+        Detect danger_zone using dynamic + rule-based indicators:
+        - Hard brake flag (explicit emergency)
+        - Leader stopped (explicit emergency)
         - Danger acceleration toward leader
         - No reaction to stopped leader
-        Only return True if explicit danger flags are set
+        - Low TTC (< 3.0 seconds = time to collision)
+        - Very close gap (< safe distance * 0.5)
+        - High deceleration (> 2.0 m/s²)
+        
+        Priority: Safety first! Be more sensitive to danger_zone
         """
+        # ===== EXPLICIT EMERGENCY FLAGS =====
+        
         # Hard brake detected
         if state.get('hard_brake', 0) == 1:
             return True
@@ -104,6 +114,39 @@ class ReactiveLayer:
         
         # No reaction to stopped leader
         if state.get('no_reaction_to_stopped_leader', 0) == 1:
+            return True
+        
+        # ===== DYNAMIC DANGER INDICATORS =====
+        
+        # TTC (Time To Collision) < 3.0 seconds = immediate danger
+        ttc = state.get('TTC', float('inf'))
+        if isinstance(ttc, (int, float)) and ttc < 3.0:
+            return True
+        
+        # Very close gap (too close for safety)
+        leader_gap = state.get('LeaderGap', float('inf'))
+        if isinstance(leader_gap, (int, float)) and leader_gap < 5.0:
+            # Less than 5m is dangerous
+            leader_stopped = state.get('leader_stopped', 0)
+            if leader_stopped == 1:
+                return True
+        
+        # Safe distance check: gap < safe_distance * 0.5
+        safe_distance = state.get('SafeDistance', None)
+        if isinstance(safe_distance, (int, float)) and safe_distance > 0:
+            if isinstance(leader_gap, (int, float)) and leader_gap < safe_distance * 0.5:
+                # Less than 50% of safe distance = danger zone
+                return True
+        
+        # High deceleration (emergency braking)
+        deceleration = state.get('Deceleration', 0)
+        if isinstance(deceleration, (int, float)) and deceleration > 2.0:
+            # Deceleration > 2.0 m/s² = emergency braking
+            return True
+        
+        # High negative acceleration (same as deceleration)
+        acceleration = state.get('Acceleration', 0)
+        if isinstance(acceleration, (int, float)) and acceleration < -2.0:
             return True
         
         return False
@@ -160,71 +203,77 @@ class ReactiveLayer:
 
     def _is_intersection_scenario(self, state: Dict) -> bool:
         """
-        Detect intersection using rules:
-        - Intersection flag
-        - Lane not well-defined or multiple lanes
-        - Traffic light/signal presence
-        - Angle changes
-        - Other vehicles at different angles
+        Detect intersection using specific rules:
+        - Direct intersection flag (from dataset)
+        - Traffic signal/light presence (explicit)
+        - Scenario column == "intersection" (if available)
+        - Multiple vehicles at different angles (high confidence)
+
+        NOTE: Lane == 0 and Angle != 0 removed (too permissive)
+              These create false positives on highways
         """
-        # Direct intersection flag
+        # Direct intersection flag (most reliable)
         if state.get('Intersection', 0) == 1:
             return True
-        
-        if state.get('intersection', 0) == 1:
+
+        # Scenario label from dataset (if available)
+        if state.get('Scenario', None) == 'intersection':
             return True
         
-        # Lane undefined or problematic
-        lane = state.get('Lane', None)
-        if lane is None or lane == -1 or (isinstance(lane, (int, float)) and lane == 0):
-            # Undefined lane often indicates intersection area
-            return True
-        
-        # Traffic signal/light presence
+        # Traffic signal/light presence (explicit indicator)
         if state.get('traffic_signal', 0) == 1:
             return True
         
         if state.get('traffic_light', 0) == 1:
             return True
-        
-        # Angle change (heading change)
-        if state.get('Angle', None) is not None:
-            angle = state.get('Angle', 0)
-            if isinstance(angle, (int, float)) and angle != 0:
-                return True
-        
-        # Multiple vehicles in different directions
-        if state.get('num_vehicles_nearby', 0) > 2:
-            return True
-        
-        # No leading vehicle but other vehicles present (intersection scenario)
-        leader_gap = state.get('LeaderGap', float('inf'))
+
+        # Multiple vehicles in area (potential intersection)
+        # BUT: Require strong evidence (> 3 vehicles)
         num_vehicles = state.get('num_vehicles_nearby', 0)
-        if (isinstance(leader_gap, (int, float)) and leader_gap == float('inf')) or leader_gap > 100:
-            if num_vehicles > 0:
+        if num_vehicles > 3:
+            # Multiple vehicles AND no clear leader = likely intersection
+            leader_gap = state.get('LeaderGap', float('inf'))
+            if (isinstance(leader_gap, (int, float)) and leader_gap == float('inf')) or leader_gap > 100:
                 return True
-        
+
         return False
 
     def _fallback_scenario_detection(self, state: Dict) -> Optional[str]:
         """
         Fallback scenario detection based on available features.
         Used when no clear scenario is detected.
-        """
-        # High speed + no leader -> likely intersection
-        speed = state.get('speed', 0)
-        leader_gap = state.get('LeaderGap', float('inf'))
-        if speed > 40 and (isinstance(leader_gap, (int, float)) and leader_gap > 50):
-            return "intersection"
         
-        # Has leader + moderate speed -> likely following/danger_zone
-        if isinstance(leader_gap, (int, float)) and leader_gap < 100:
-            if speed > 20:
-                ttc = state.get('TTC', float('inf'))
-                if isinstance(ttc, (int, float)) and ttc < 10:
-                    return "danger_zone"
-                else:
-                    return "overtaking"
+        Priority: danger_zone > overtaking > intersection
+        """
+        # ===== CHECK FOR DANGER_ZONE FIRST =====
+        # Even if explicit flags missed, check dynamic danger
+        ttc = state.get('TTC', float('inf'))
+        leader_gap = state.get('LeaderGap', float('inf'))
+        
+        # Low TTC = danger zone
+        if isinstance(ttc, (int, float)) and ttc < 3.0:
+            return "danger_zone"
+        
+        # Very close gap = danger zone
+        if isinstance(leader_gap, (int, float)) and leader_gap < 5.0:
+            return "danger_zone"
+        
+        # ===== CHECK FOR OVERTAKING =====
+        # Has leader + gap > 5m + speed differential
+        if isinstance(leader_gap, (int, float)) and leader_gap > 5.0 and leader_gap < 100:
+            speed = state.get('speed', 0)
+            leader_speed = state.get('LeaderSpeed', speed)
+            
+            # Ego faster than leader by 5+ km/h = overtaking
+            if speed - leader_speed > 5:
+                return "overtaking"
+        
+        # ===== CHECK FOR INTERSECTION =====
+        # High speed + no leader = could be intersection
+        # But be conservative (speed > 30, not 40)
+        speed = state.get('speed', 0)
+        if speed > 30 and (isinstance(leader_gap, (int, float)) and leader_gap > 100):
+            return "intersection"
         
         return None
 
@@ -247,27 +296,32 @@ class ReactiveLayer:
         if self.loaded_scenario_models and detected_scenario and detected_scenario in self.loaded_scenario_models:
             ml_result = self.evaluate_scenario_model(detected_scenario, vehicle_state)
             if "error" not in ml_result:
-                risk = float(ml_result.get("risk_score", 0.0))
+                risk = float(ml_result.get("risk_score", 0.0))  # P(unsafe) from model
                 unsafe = bool(ml_result.get("is_unsafe", False))
 
-                if unsafe and risk >= 0.85:
-                    severity = "emergency"
-                elif unsafe and risk >= 0.70:
-                    severity = "critical"
-                elif risk >= 0.55:
-                    severity = "warning"
-                else:
-                    severity = None
+                # Only generate alert if risk exceeds confidence threshold
+                if unsafe and risk >= self.confidence_threshold:
+                    # Severity based on how much risk exceeds threshold
+                    confidence_margin = risk - self.confidence_threshold
+                    
+                    if risk >= 0.90:
+                        severity = "emergency"
+                    elif risk >= 0.80:
+                        severity = "critical"
+                    elif risk >= self.confidence_threshold:
+                        severity = "warning"
+                    else:
+                        severity = None
 
-                if severity is not None:
-                    alert = CriticalAlert(
-                        type=f"{detected_scenario}_ml_risk",
-                        severity=severity,
-                        message=f"ML {severity.upper()}: {detected_scenario} risk score={risk:.2f}",
-                        timestamp=time.time(),
-                        reaction_time_ms=0.0,
-                        parameters=ml_result,
-                    )
+                    if severity is not None:
+                        alert = CriticalAlert(
+                            type=f"{detected_scenario}_ml_risk",
+                            severity=severity,
+                            message=f"ML {severity.upper()}: {detected_scenario} risk score={risk:.2f}",
+                            timestamp=time.time(),
+                            reaction_time_ms=0.0,
+                            parameters=ml_result,
+                        )
 
         # Calcul du temps de réaction
         if alert:
@@ -475,6 +529,25 @@ class ReactiveLayer:
             "max_response_time": 0.0
         }
         self.alert_history = []
+
+    def set_confidence_threshold(self, threshold: float) -> None:
+        """
+        Adjust the confidence threshold for alert generation.
+        
+        Args:
+            threshold: Risk score threshold (0.0-1.0)
+                - 0.50: Very sensitive (detect 100% but many false alerts)
+                - 0.70: Balanced (good default for safety-critical)
+                - 0.80: More selective (fewer false alerts)
+                - 0.90: Very conservative (may miss some dangers)
+        
+        Example:
+            reactive.set_confidence_threshold(0.80)  # More selective
+        """
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"Threshold must be between 0.0 and 1.0, got {threshold}")
+        self.confidence_threshold = threshold
+        print(f"✅ Confidence threshold updated to {threshold:.0%}")
 
 
 # Test function for PyCharm
