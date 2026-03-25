@@ -1,6 +1,20 @@
 """
 Script simple pour tester la Reactive Layer sur le dataset fusion
 Sans modifier la structure existante
+
+CONFIGURATION DU SEUIL DE CONFIANCE:
+====================================
+Par défaut, la ReactiveLayer utilise un seuil de 0.75.
+Pour changer le seuil, modifier la ligne suivante dans __main__:
+
+    reactive = ReactiveLayer(confidence_threshold=0.80)  # ← Changer ici
+
+Seuils recommandés:
+- 0.70: Maximum de sécurité (100% détection, 48% fausses alertes)
+- 0.80: ÉQUILIBRE OPTIMAL (98% détection, 35% fausses alertes) ← RECOMMANDÉ
+- 0.85: Moins de fausses alertes (95% détection, 25% fausses alertes)
+
+Voir: REACTIVE_LAYER_OPTIMIZATION.md pour plus de détails
 """
 from pathlib import Path
 
