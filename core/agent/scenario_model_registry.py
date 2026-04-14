@@ -67,17 +67,9 @@ class ScenarioModelRegistry:
             ),
             ScenarioTrainingConfig(
                 name="intersection",
-                csv_path=data_dir / "Fusion_dataset.csv",
+                csv_path=data_dir / "dataset_apres_smote_intersection.csv",
                 target_col="SafeUnsafeCrossing",
-                drop_cols=[
-                    "Scenario",
-                    "AccidentTypes",
-                    "SafeUnsafeOvertaking",
-                    "SafeDangerZone",
-                    "IsAccidentCase",
-                ],
-                filter_col="Scenario",
-                filter_value="intersection",
+                drop_cols=[],
             ),
         ]
 
